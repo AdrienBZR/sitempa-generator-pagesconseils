@@ -129,17 +129,24 @@ async def generate_sitemap():
 
     count = 0
     if data:
-        for row in data:
-            if row.get(statut_key) != target_statut:
+            status = row.get(statut_key)
+            print(f"Checking row: {url_val} | Status: {status}") # DEBUG
+            
+            if status != target_statut:
+                # Check for encoding/whitespace issues
+                if str(status).strip() == target_statut:
+                     print(f"WARN: Status match check failed due to whitespace? '{status}' vs '{target_statut}'")
                 continue
 
             url_val = row.get(url_key)
             if not url_val:
+                print("Skipping: No URL found")
                 continue
             
             # Note: synchronous validation might slow down request. 
             # Ideally this should be cached or async.
             if not validate_url(url_val):
+               print(f"Skipping: Validation failed for {url_val}")
                continue
 
             url_element = ET.SubElement(urlset, "url")
