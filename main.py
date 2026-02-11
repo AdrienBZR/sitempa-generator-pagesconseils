@@ -151,9 +151,9 @@ async def generate_sitemap():
             
             # Note: synchronous validation might slow down request. 
             # Ideally this should be cached or async.
-            if not validate_url(url_val):
-               print(f"Skipping: Validation failed for {url_val}")
-               continue
+            # if not validate_url(url_val):
+            #    print(f"Skipping: Validation failed for {url_val}")
+            #    continue
 
             url_element = ET.SubElement(urlset, "url")
             loc_element = ET.SubElement(url_element, "loc")
