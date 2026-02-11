@@ -30,15 +30,17 @@ def get_credentials():
         raise ValueError("Environment variable GOOGLE_CREDENTIALS_JSON is not set.")
     
     # Try decoding base64 first (Most robust method)
+    base64_error = None
     try:
         # Check if it looks like base64 (no curly braces at start)
-        cleaned_val = creds_json.strip()
+        cleaned_val = creds_json.strip().replace('\n', '').replace('\r', '').replace(' ', '')
         if not cleaned_val.startswith("{"):
             decoded_bytes = base64.b64decode(cleaned_val)
             decoded_str = decoded_bytes.decode('utf-8')
             return Credentials.from_service_account_info(json.loads(decoded_str), scopes=SCOPES)
-    except Exception:
-        pass # Not base64 or failed, verify other methods
+    except Exception as e:
+        base64_error = str(e)
+        print(f"Base64 decoding failed: {e}") # Log for debugging
 
     try:
         # Try standard JSON parsing
@@ -47,7 +49,6 @@ def get_credentials():
         # Fallback: Try parsing as a Python dictionary (single quotes)
         try:
             # Handle newlines in private key which might cause literal_eval to fail
-            # if they are escaped as literal \n characters
             clean_json = creds_json.replace('\n', '\\n') 
             creds_info = ast.literal_eval(clean_json)
         except (ValueError, SyntaxError):
@@ -60,7 +61,10 @@ def get_credentials():
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                raise ValueError(f"Failed to parse credentials: {e} (First 20 chars: {creds_json[:20]!r})")
+                
+                # construct detailed error message
+                msg = f"Failed to parse credentials. \nJSON Error: {e}. \nBase64 Error: {base64_error}. \nFirst 20 chars: {creds_json[:20]!r}"
+                raise ValueError(msg)
             
     return Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
