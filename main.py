@@ -8,7 +8,7 @@ import os
 # Configuration
 SERVICE_ACCOUNT_FILE = '../creds/solocal-poc-f9a485d4ac05.json'
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SHEET_ID = '1_V57r3HfIlCFfu6MvPPbiL0eQBf7V-wA8CCNFQljnAs'
+SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
 OUTPUT_FILE = 'sitemap.xml'
 
 # XML Namespaces
@@ -18,7 +18,7 @@ XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 scraper = cloudscraper.create_scraper()
 
 def get_sheet_data():
-    """Authenticates and fetches data from the Google Sheet."""
+    """Authenticates and fetches records from ALL worksheets in the Google Sheet."""
     try:
         # Resolve absolute path for credentials
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -27,9 +27,17 @@ def get_sheet_data():
         creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
         client = gspread.authorize(creds)
         sheet = client.open_by_key(SHEET_ID)
-        worksheet = sheet.get_worksheet(0) # Assuming first sheet
-        records = worksheet.get_all_records()
-        return records
+        
+        all_records = []
+        worksheets = sheet.worksheets()
+        print(f"Found {len(worksheets)} worksheets. Processing...")
+        
+        for ws in worksheets:
+            print(f"Reading worksheet: {ws.title}")
+            records = ws.get_all_records()
+            all_records.extend(records)
+            
+        return all_records
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -49,6 +57,13 @@ def validate_url(url):
         print(f"Skipping {url} - Error: {e}")
         return False
 
+def format_date(date_str):
+    """Converts DD/MM/YYYY to YYYY-MM-DD."""
+    try:
+        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return date_str # Return original if parse fails
+
 def generate_sitemap(data):
     """Generates a sitemap.xml file from the provided data."""
     urlset = ET.Element("urlset", xmlns=XMLNS)
@@ -57,22 +72,31 @@ def generate_sitemap(data):
         print("No data found to generate sitemap.")
         return
 
-    # Explicitly matched columns from inspection
-    url_key = 'url'
-    lastmod_key = 'date'
+    # Explicit column names
+    url_key = 'URL article'
+    lastmod_key = 'Date de MEP'
+    statut_key = 'Statut'
+    target_statut = 'Programmé'
     
-    print(f"Using columns - URL: {url_key}, LastMod: {lastmod_key}")
+    print(f"Using columns - URL: '{url_key}', LastMod: '{lastmod_key}', Filter: '{statut_key}' == '{target_statut}'")
 
     count = 0
+    skipped = 0
     total = len(data)
     
     for i, row in enumerate(data):
+        # 1. Filter by Statut
+        if row.get(statut_key) != target_statut:
+            skipped += 1
+            continue
+
         url_val = row.get(url_key)
         if not url_val:
             continue
             
-        print(f"Processing {i+1}/{total}: {url_val}")
+        print(f"Processing candidate ({i+1}/{total}): {url_val}")
         
+        # 2. Validate URL (200 OK)
         if not validate_url(url_val):
             continue
 
@@ -80,21 +104,24 @@ def generate_sitemap(data):
         loc_element = ET.SubElement(url_element, "loc")
         loc_element.text = str(url_val).strip()
 
+        # 3. Handle Date
         if lastmod_key and row.get(lastmod_key):
-            lastmod_val = row.get(lastmod_key)
+            raw_date = str(row.get(lastmod_key)).strip()
+            formatted_date = format_date(raw_date)
+            
             lastmod_element = ET.SubElement(url_element, "lastmod")
-            lastmod_element.text = str(lastmod_val).strip()
+            lastmod_element.text = formatted_date
             
         count += 1
 
     tree = ET.ElementTree(urlset)
-
     
     # Pretty printing (Python 3.9+ has indent)
     ET.indent(tree, space="  ", level=0)
     
     tree.write(OUTPUT_FILE, encoding='utf-8', xml_declaration=True)
     print(f"Sitemap generated at {os.path.abspath(OUTPUT_FILE)}")
+    print(f"Stats: {count} URLs added, {skipped} skipped (wrong status), Total rows processed: {total}")
 
 def main():
     try:
