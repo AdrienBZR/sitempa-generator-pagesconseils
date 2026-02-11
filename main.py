@@ -34,9 +34,19 @@ def get_credentials():
     except json.JSONDecodeError:
         # Fallback: Try parsing as a Python dictionary (single quotes)
         try:
-            creds_info = ast.literal_eval(creds_json)
-        except (ValueError, SyntaxError) as e:
-            raise ValueError(f"Failed to parse credentials: {e}")
+            # Handle newlines in private key which might cause literal_eval to fail
+            # if they are escaped as literal \n characters
+            clean_json = creds_json.replace('\n', '\\n') 
+            creds_info = ast.literal_eval(clean_json)
+        except (ValueError, SyntaxError):
+            # Last resort: simplistic manual replacement for common issues
+            try:
+                # Replace single quotes with double quotes (imperfect but helps)
+                # and ensure control characters are escaped
+                clean_json = creds_json.replace("'", '"').replace('\n', '\\n')
+                creds_info = json.loads(clean_json)
+            except Exception as e:
+                raise ValueError(f"Failed to parse credentials: {e}")
             
     return Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
