@@ -36,7 +36,11 @@ def get_credentials():
         cleaned_val = creds_json.strip().replace('\n', '').replace('\r', '').replace(' ', '')
         if not cleaned_val.startswith("{"):
             decoded_bytes = base64.b64decode(cleaned_val)
-            decoded_str = decoded_bytes.decode('utf-8')
+            try:
+                decoded_str = decoded_bytes.decode('utf-8')
+            except UnicodeDecodeError:
+                # Fallback for weird encoding artifacts
+                decoded_str = decoded_bytes.decode('latin-1')
             return Credentials.from_service_account_info(json.loads(decoded_str), scopes=SCOPES)
     except Exception as e:
         base64_error = str(e)
