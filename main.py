@@ -88,6 +88,7 @@ def generate_sitemap(data):
         count += 1
 
     tree = ET.ElementTree(urlset)
+
     
     # Pretty printing (Python 3.9+ has indent)
     ET.indent(tree, space="  ", level=0)
