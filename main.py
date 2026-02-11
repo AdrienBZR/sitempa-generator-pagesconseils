@@ -129,6 +129,9 @@ async def generate_sitemap():
 
     count = 0
     if data:
+        for row in data:
+            url_val = row.get(url_key) # Get URL early for debug log
+            
             status = row.get(statut_key)
             print(f"Checking row: {url_val} | Status: {status}") # DEBUG
             
@@ -138,7 +141,9 @@ async def generate_sitemap():
                      print(f"WARN: Status match check failed due to whitespace? '{status}' vs '{target_statut}'")
                 continue
 
-            url_val = row.get(url_key)
+            if not url_val:
+                print("Skipping: No URL found")
+                continue
             if not url_val:
                 print("Skipping: No URL found")
                 continue
