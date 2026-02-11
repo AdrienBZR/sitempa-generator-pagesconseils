@@ -1,24 +1,9 @@
-import os
-import json
-import cloudscraper
-import gspread
-from google.oauth2.service_account import Credentials
-import xml.etree.ElementTree as ET
-from datetime import datetime
-from fastapi import FastAPI, Response, HTTPException
+import ast
 
-app = FastAPI()
-
-# Configuration
-SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
-SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
-XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
-
-# Initialize scraper
-scraper = cloudscraper.create_scraper()
+# ... imports ...
 
 def get_credentials():
-    """Retrieves credentials from environment variable."""
+    """Retrieves credentials from environment variable (JSON or Python dict string)."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if not creds_json:
         # Fallback for local development if file exists
@@ -27,8 +12,16 @@ def get_credentials():
              return Credentials.from_service_account_file(local_creds, scopes=SCOPES)
         raise ValueError("Environment variable GOOGLE_CREDENTIALS_JSON is not set.")
     
-    # Parse JSON string from env var
-    creds_info = json.loads(creds_json)
+    try:
+        # Try standard JSON parsing
+        creds_info = json.loads(creds_json)
+    except json.JSONDecodeError:
+        # Fallback: Try parsing as a Python dictionary (single quotes)
+        try:
+            creds_info = ast.literal_eval(creds_json)
+        except (ValueError, SyntaxError) as e:
+            raise ValueError(f"Failed to parse credentials: {e}")
+            
     return Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
 def get_sheet_data():
