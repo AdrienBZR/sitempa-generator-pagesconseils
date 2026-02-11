@@ -1,6 +1,22 @@
 import ast
+import os
+import json
+import cloudscraper
+import gspread
+from google.oauth2.service_account import Credentials
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from fastapi import FastAPI, Response, HTTPException
 
-# ... imports ...
+app = FastAPI()
+
+# Configuration
+SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
+XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+
+# Initialize scraper
+scraper = cloudscraper.create_scraper()
 
 def get_credentials():
     """Retrieves credentials from environment variable (JSON or Python dict string)."""
