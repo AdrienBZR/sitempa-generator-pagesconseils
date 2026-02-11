@@ -16,18 +16,8 @@ SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapi
 SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
 XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 
-# Initialize scraper with browser emulation
-scraper = cloudscraper.create_scraper(
-    browser={
-        'browser': 'chrome',
-        'platform': 'windows',
-        'desktop': True
-    }
-)
-scraper.headers.update({
-    'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-})
+# Initialize scraper
+scraper = cloudscraper.create_scraper()
 
 def get_credentials():
     """Retrieves credentials from environment variable (JSON or Python dict string)."""
@@ -161,9 +151,9 @@ async def generate_sitemap():
             
             # Note: synchronous validation might slow down request. 
             # Ideally this should be cached or async.
-            if not validate_url(url_val):
-               print(f"Skipping: Validation failed for {url_val}")
-               continue
+            # if not validate_url(url_val):
+            #    print(f"Skipping: Validation failed for {url_val}")
+            #    continue
 
             url_element = ET.SubElement(urlset, "url")
             loc_element = ET.SubElement(url_element, "loc")
