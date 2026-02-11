@@ -1,4 +1,5 @@
 import ast
+import base64
 import os
 import json
 import cloudscraper
@@ -28,6 +29,17 @@ def get_credentials():
              return Credentials.from_service_account_file(local_creds, scopes=SCOPES)
         raise ValueError("Environment variable GOOGLE_CREDENTIALS_JSON is not set.")
     
+    # Try decoding base64 first (Most robust method)
+    try:
+        # Check if it looks like base64 (no curly braces at start)
+        cleaned_val = creds_json.strip()
+        if not cleaned_val.startswith("{"):
+            decoded_bytes = base64.b64decode(cleaned_val)
+            decoded_str = decoded_bytes.decode('utf-8')
+            return Credentials.from_service_account_info(json.loads(decoded_str), scopes=SCOPES)
+    except Exception:
+        pass # Not base64 or failed, verify other methods
+
     try:
         # Try standard JSON parsing
         creds_info = json.loads(creds_json)
@@ -46,7 +58,9 @@ def get_credentials():
                 clean_json = creds_json.replace("'", '"').replace('\n', '\\n')
                 creds_info = json.loads(clean_json)
             except Exception as e:
-                raise ValueError(f"Failed to parse credentials: {e}")
+                import traceback
+                traceback.print_exc()
+                raise ValueError(f"Failed to parse credentials: {e} (First 20 chars: {creds_json[:20]!r})")
             
     return Credentials.from_service_account_info(creds_info, scopes=SCOPES)
 
