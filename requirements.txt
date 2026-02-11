@@ -1,3 +1,5 @@
 gspread
 google-auth
 cloudscraper
+fastapi
+uvicorn
