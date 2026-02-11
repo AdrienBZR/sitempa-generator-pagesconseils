@@ -99,6 +99,7 @@ def validate_url(url):
     """Checks if the URL returns 200 OK using cloudscraper."""
     try:
         response = scraper.get(url)
+        print(f"Validation: {url} -> {response.status_code}") # DEBUG
         return response.status_code == 200
     except Exception as e:
         print(f"Skipping {url} - Error: {e}")
