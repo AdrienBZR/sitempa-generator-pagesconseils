@@ -105,11 +105,50 @@ def validate_url(url):
         print(f"Skipping {url} - Error: {e}")
         return False
 
-def format_date(date_str):
-    """Converts DD/MM/YYYY to YYYY-MM-DD."""
+def parse_date(date_str):
+    """Converts DD/MM/YYYY or French format (jeudi 12 février 2026) to YYYY-MM-DD."""
+    if not date_str:
+        return None
+        
     try:
-        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+        # Try numeric first (legacy format)
+        return datetime.strptime(str(date_str).strip(), "%d/%m/%Y").strftime("%Y-%m-%d")
     except ValueError:
+        pass
+        
+    try:
+        # Try French text format: "jeudi 12 février 2026"
+        # We need a custom mapping because locales might not be installed in the slim docker image
+        lower_str = str(date_str).strip().lower()
+        
+        # Remove day name if present (e.g. "jeudi ")
+        parts = lower_str.split()
+        
+        # Handle "12 février 2026" or "jeudi 12 février 2026"
+        if len(parts) == 4: # day_name day_num month_name year
+             parts = parts[1:] # Drop day name
+             
+        if len(parts) != 3:
+             return date_str # Return raw if format not recognized
+             
+        day, month_name, year = parts
+        
+        month_map = {
+            'janvier': '01', 'février': '02', 'mars': '03', 'avril': '04',
+            'mai': '05', 'juin': '06', 'juillet': '07', 'août': '08',
+            'septembre': '09', 'octobre': '10', 'novembre': '11', 'décembre': '12'
+        }
+        
+        month_num = month_map.get(month_name)
+        if not month_num:
+             return date_str
+             
+        # Normalize day (e.g. 5 -> 05)
+        day = day.zfill(2)
+        
+        return f"{year}-{month_num}-{day}"
+        
+    except Exception:
         return date_str
 
 @app.get("/sitemap.xml")
@@ -126,7 +165,7 @@ async def generate_sitemap():
     url_key = 'URL article'
     lastmod_key = 'Date de MEP'
     statut_key = 'Statut'
-    target_statut = 'Programmé'
+    target_statuses = ['Programmé', 'Publié']
 
     count = 0
     if data:
@@ -134,17 +173,14 @@ async def generate_sitemap():
             url_val = row.get(url_key) # Get URL early for debug log
             
             status = row.get(statut_key)
-            print(f"Checking row: {url_val} | Status: {status}") # DEBUG
+            # print(f"Checking row: {url_val} | Status: {status}") # DEBUG - Clean up logs slightly
             
-            if status != target_statut:
+            if status not in target_statuses:
                 # Check for encoding/whitespace issues
-                if str(status).strip() == target_statut:
-                     print(f"WARN: Status match check failed due to whitespace? '{status}' vs '{target_statut}'")
+                if str(status).strip() in target_statuses:
+                     print(f"WARN: Status match check failed due to whitespace? '{status}'")
                 continue
 
-            if not url_val:
-                print("Skipping: No URL found")
-                continue
             if not url_val:
                 print("Skipping: No URL found")
                 continue
@@ -161,7 +197,7 @@ async def generate_sitemap():
 
             if lastmod_key and row.get(lastmod_key):
                 raw_date = str(row.get(lastmod_key)).strip()
-                formatted_date = format_date(raw_date)
+                formatted_date = parse_date(raw_date)
                 
                 lastmod_element = ET.SubElement(url_element, "lastmod")
                 lastmod_element.text = formatted_date
