@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 venv/
 sitemap.xml
+coolify_secret.txt
+generate_creds.py
