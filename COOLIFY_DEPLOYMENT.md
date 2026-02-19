@@ -26,6 +26,15 @@ cat ../creds/solocal-poc-f9a485d4ac05.json | jq -c .
     *   **Value** : Collez ici le contenu complet du fichier JSON (copié à l'étape 1).
 5.  Sauvegardez.
 
+## 2.1 Configurer le Port (CRITIQUE)
+
+Par défaut, Coolify peut écouter sur le port 3000 ou 80. Votre application écoute sur le port **8000**.
+
+1.  Allez dans l'onglet **Configuration** > **General**.
+2.  Dans le champ **Ports Exposes**, mettez : `8000`.
+3.  Sauvegardez.
+4.  Cliquez sur **Redeploy**.
+
 ## 3. Déploiement
 
 1.  Lancez le déploiement.
