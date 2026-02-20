@@ -160,11 +160,13 @@ async def generate_sitemap():
         raise HTTPException(status_code=500, detail=str(e))
 
     urlset = ET.Element("urlset", xmlns=XMLNS)
+    urlset.set("xmlns:news", "http://www.google.com/schemas/sitemap-news/0.9")
     
     # Configuration
     url_key = 'URL article'
     lastmod_key = 'Date de MEP'
     statut_key = 'Statut'
+    plage_horaire_key = 'Plage Horaire'
     target_statuses = ['Programmé', 'Publié']
 
     count = 0
@@ -201,6 +203,11 @@ async def generate_sitemap():
                 
                 lastmod_element = ET.SubElement(url_element, "lastmod")
                 lastmod_element.text = formatted_date
+                
+                plage_horaire = str(row.get(plage_horaire_key, "")).strip().lower()
+                if "matin" in plage_horaire and formatted_date:
+                    news_pub_date = ET.SubElement(url_element, "news:publication_date")
+                    news_pub_date.text = f"{formatted_date}T05:00+01:00"
             
             count += 1
             
