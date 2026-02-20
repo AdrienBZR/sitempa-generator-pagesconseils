@@ -166,7 +166,7 @@ async def generate_sitemap():
     url_key = 'URL article'
     lastmod_key = 'Date de MEP'
     statut_key = 'Statut'
-    plage_horaire_key = 'Plage Horaire'
+    plage_horaire_key = 'Plage horaire'
     target_statuses = ['Programmé', 'Publié']
 
     count = 0
