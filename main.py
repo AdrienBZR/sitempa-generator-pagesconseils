@@ -206,7 +206,8 @@ async def generate_sitemap():
                 
                 plage_horaire = str(row.get(plage_horaire_key, "")).strip().lower()
                 if "matin" in plage_horaire and formatted_date:
-                    news_pub_date = ET.SubElement(url_element, "news:publication_date")
+                    news_element = ET.SubElement(url_element, "news:news")
+                    news_pub_date = ET.SubElement(news_element, "news:publication_date")
                     news_pub_date.text = f"{formatted_date}T05:00+01:00"
             
             count += 1
