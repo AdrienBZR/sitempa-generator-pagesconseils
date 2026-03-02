@@ -211,9 +211,9 @@ async def generate_sitemap():
                     if "matin" in plage_horaire:
                         time_str = "05:00+01:00"
                     elif "midi" in plage_horaire:
-                        time_str = "12:00+01:00"
+                        time_str = "11:00+01:00"
                     elif "soir" in plage_horaire:
-                        time_str = "18:00+01:00"
+                        time_str = "17:00+01:00"
                         
                     if time_str:
                         news_element = ET.SubElement(url_element, "news:news")
