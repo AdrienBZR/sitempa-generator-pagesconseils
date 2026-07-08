@@ -351,8 +351,23 @@ def fetch_prod_sitemap_entries():
 
     Returns a list of dicts {url, publication_date, name, title}. Raises on
     HTTP error, unparseable body, or an empty sitemap so the caller can fall
-    back to the sheet-based generation."""
-    response = scraper.get(PROD_SITEMAP_URL, timeout=30)
+    back to the sheet-based generation.
+
+    Egress can be routed through a residential proxy / unlocker (e.g. Bright
+    Data) by setting CRAWL_PROXY_URL, needed when the datacenter IP gets
+    flagged by Cloudflare. Without it the request goes out directly."""
+    request_kwargs = {"timeout": 30}
+    proxy_url = os.environ.get("CRAWL_PROXY_URL")
+    if proxy_url:
+        request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
+        # Some unlockers terminate TLS with their own CA; allow opting out of
+        # verification via CRAWL_PROXY_INSECURE=1.
+        if os.environ.get("CRAWL_PROXY_INSECURE", "").lower() in ("1", "true", "yes"):
+            request_kwargs["verify"] = False
+        # Log host:port only, never the embedded credentials.
+        print(f"Crawling via proxy {proxy_url.rsplit('@', 1)[-1]}")
+
+    response = scraper.get(PROD_SITEMAP_URL, **request_kwargs)
     if response.status_code != 200:
         raise RuntimeError(f"prod sitemap fetch returned HTTP {response.status_code}")
 
