@@ -16,6 +16,11 @@ app = FastAPI()
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
 XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
+NEWS_NS = "http://www.google.com/schemas/sitemap-news/0.9"
+
+# Live production Google-News sitemap (source of truth for recently published
+# URLs). Fetched through Cloudflare via cloudscraper.
+PROD_SITEMAP_URL = "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml"
 
 # --- Resilient parsing configuration -------------------------------------
 # The sheet is edited by humans who sometimes delete the header row, rename
@@ -341,16 +346,105 @@ def build_sitemap_xml(data):
     return f.getvalue()
 
 
+def fetch_prod_sitemap_entries():
+    """Fetch and parse the live prod news sitemap (through Cloudflare).
+
+    Returns a list of dicts {url, publication_date, name, title}. Raises on
+    HTTP error, unparseable body, or an empty sitemap so the caller can fall
+    back to the sheet-based generation."""
+    response = scraper.get(PROD_SITEMAP_URL, timeout=30)
+    if response.status_code != 200:
+        raise RuntimeError(f"prod sitemap fetch returned HTTP {response.status_code}")
+
+    ns = {'s': XMLNS, 'news': NEWS_NS}
+    root = ET.fromstring(response.content)  # parse bytes for correct utf-8
+
+    entries = []
+    for url_el in root.findall('s:url', ns):
+        loc = (url_el.findtext('s:loc', default='', namespaces=ns) or '').strip()
+        if not loc:
+            continue
+        entries.append({
+            'url': loc,
+            'publication_date': (url_el.findtext('.//news:publication_date', default='', namespaces=ns) or '').strip(),
+            'name': (url_el.findtext('.//news:name', default='', namespaces=ns) or '').strip(),
+            'title': (url_el.findtext('.//news:title', default='', namespaces=ns) or '').strip(),
+        })
+
+    if not entries:
+        raise RuntimeError("prod sitemap parsed but contained 0 URLs")
+    print(f"Crawled prod sitemap: {len(entries)} URLs")
+    return entries
+
+
+def cross_check_with_sheet(entries):
+    """Match crawled URLs against the sheet (correspondence only, no filtering).
+
+    For now this just reports how many crawled URLs are known to the sheet, so
+    the mapping is observable. Filtering on status can be layered on later."""
+    try:
+        sheet_rows = get_sheet_data()
+    except Exception as e:
+        print(f"Cross-check skipped (sheet unavailable): {e}")
+        return
+
+    def key(u):
+        return str(u).strip().rstrip('/')
+
+    sheet_index = {key(r['url']): r for r in sheet_rows if r.get('url')}
+    matched = 0
+    for entry in entries:
+        row = sheet_index.get(key(entry['url']))
+        if row:
+            matched += 1
+            entry['sheet_statut'] = row.get('statut', '')
+        else:
+            entry['sheet_statut'] = None
+    print(f"Cross-check: {matched}/{len(entries)} crawled URLs found in sheet")
+
+
+def build_news_sitemap_from_entries(entries):
+    """Build sitemap XML bytes from crawled prod entries."""
+    urlset = ET.Element("urlset", xmlns=XMLNS)
+    urlset.set("xmlns:news", NEWS_NS)
+
+    for entry in entries:
+        url_element = ET.SubElement(urlset, "url")
+        ET.SubElement(url_element, "loc").text = entry['url']
+        pub_date = entry.get('publication_date')
+        if pub_date:
+            ET.SubElement(url_element, "lastmod").text = pub_date[:10]
+            news_element = ET.SubElement(url_element, "news:news")
+            ET.SubElement(news_element, "news:publication_date").text = pub_date
+
+    tree = ET.ElementTree(urlset)
+    ET.indent(tree, space="  ", level=0)
+    from io import BytesIO
+    f = BytesIO()
+    tree.write(f, encoding='utf-8', xml_declaration=True)
+    return f.getvalue()
+
+
 @app.get("/sitemap.xml")
 async def generate_sitemap():
-    """Generates and returns sitemap.xml."""
-    try:
-        data = get_sheet_data()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Crawl-first sitemap served at the existing address.
 
-    xml_content = build_sitemap_xml(data)
-    return Response(content=xml_content, media_type="application/xml")
+    Source of truth = the live prod sitemap (crawled through Cloudflare),
+    cross-checked against the sheet. If the crawl fails for any reason, falls
+    back to the sheet-based generation so the endpoint always answers."""
+    try:
+        entries = fetch_prod_sitemap_entries()
+        cross_check_with_sheet(entries)
+        xml_content = build_news_sitemap_from_entries(entries)
+        print(f"Serving crawled sitemap: {len(entries)} URLs")
+        return Response(content=xml_content, media_type="application/xml")
+    except Exception as e:
+        print(f"Crawl failed ({e!r}); falling back to sheet-based generation")
+        try:
+            data = get_sheet_data()
+        except Exception as sheet_err:
+            raise HTTPException(status_code=500, detail=f"crawl and sheet both failed: {sheet_err}")
+        return Response(content=build_sitemap_xml(data), media_type="application/xml")
 
 
 if __name__ == "__main__":
@@ -360,7 +454,24 @@ if __name__ == "__main__":
     # builds the sitemap and writes it to a file (default: sitemap.xml) so you
     # can inspect the result without running the web server. Needs credentials
     # (GOOGLE_CREDENTIALS_JSON env var or ../creds/*.json).
-    if "--dump" in sys.argv:
+    if "--crawl" in sys.argv:
+        # Crawl-first flow: fetch prod sitemap, cross-check the sheet, dump the
+        # result. Falls back to sheet-based generation if the crawl fails.
+        out_path = "sitemap-news.xml"
+        for arg in sys.argv[1:]:
+            if not arg.startswith("-"):
+                out_path = arg
+        try:
+            entries = fetch_prod_sitemap_entries()
+            cross_check_with_sheet(entries)
+            xml_content = build_news_sitemap_from_entries(entries)
+        except Exception as e:
+            print(f"Crawl failed ({e!r}); falling back to sheet-based generation")
+            xml_content = build_sitemap_xml(get_sheet_data())
+        with open(out_path, "wb") as fh:
+            fh.write(xml_content)
+        print(f"Wrote {out_path}")
+    elif "--dump" in sys.argv:
         out_path = "sitemap.xml"
         for arg in sys.argv[1:]:
             if arg != "--dump" and not arg.startswith("-"):
