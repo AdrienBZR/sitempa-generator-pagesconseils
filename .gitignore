@@ -6,3 +6,6 @@ venv/
 sitemap.xml
 coolify_secret.txt
 generate_creds.py
+.env.local
+creds/
+*.json
