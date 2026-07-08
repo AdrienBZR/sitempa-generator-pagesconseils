@@ -346,33 +346,91 @@ def build_sitemap_xml(data):
     return f.getvalue()
 
 
+BRIGHTDATA_API_URL = "https://api.brightdata.com/request"
+
+
+def _fetch_attempt(api_key, proxy_url):
+    """One fetch attempt for the current egress mode. Returns bytes or raises."""
+    if api_key:
+        zone = os.environ.get("BRIGHTDATA_ZONE", "sitemap_unlocker")
+        country = os.environ.get("BRIGHTDATA_COUNTRY", "fr")  # egress from France
+        payload = {"zone": zone, "url": PROD_SITEMAP_URL, "format": "raw"}
+        if country:
+            payload["country"] = country
+        response = scraper.post(
+            BRIGHTDATA_API_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=60,
+        )
+        # Web Unlocker reports target-side failure as HTTP 200 + empty body +
+        # x-brd-error header (and only bills successful unlocks).
+        brd_err = response.headers.get("x-brd-error")
+        if brd_err:
+            raise RuntimeError(f"brd-error: {brd_err}")
+        if response.status_code != 200 or not response.content:
+            raise RuntimeError(f"API HTTP {response.status_code}, {len(response.content)} bytes")
+        return response.content
+
+    if proxy_url:
+        request_kwargs = {"timeout": 30, "proxies": {"http": proxy_url, "https": proxy_url}}
+        # Some unlockers terminate TLS with their own CA; allow opting out.
+        if os.environ.get("CRAWL_PROXY_INSECURE", "").lower() in ("1", "true", "yes"):
+            request_kwargs["verify"] = False
+        response = scraper.get(PROD_SITEMAP_URL, **request_kwargs)
+    else:
+        response = scraper.get(PROD_SITEMAP_URL, timeout=30)
+
+    if response.status_code != 200:
+        raise RuntimeError(f"HTTP {response.status_code}")
+    return response.content
+
+
+def _fetch_prod_sitemap_raw():
+    """Fetch the raw prod sitemap bytes, choosing the egress mode by env.
+
+    Priority:
+      1. Bright Data Web Unlocker API   -> BRIGHTDATA_API_KEY (+ BRIGHTDATA_ZONE)
+      2. Generic proxy / ISP proxy      -> CRAWL_PROXY_URL (+ CRAWL_PROXY_INSECURE)
+      3. Direct request                 -> no env set (default)
+
+    pagesjaunes sits behind Cloudflare, which rejects a fraction of exit IPs
+    with a 403 even from residential/ISP pools, so every mode is retried up to
+    CRAWL_MAX_ATTEMPTS until a good IP answers."""
+    api_key = os.environ.get("BRIGHTDATA_API_KEY")
+    proxy_url = os.environ.get("CRAWL_PROXY_URL")
+    # Web Unlocker (with Premium domains) solves Cloudflare server-side, so a
+    # low retry count is enough — we deliberately avoid hammering the target
+    # (traffic is only ~3 crawls/day).
+    max_attempts = int(os.environ.get("CRAWL_MAX_ATTEMPTS", "3"))
+
+    mode = "Bright Data API" if api_key else ("proxy " + proxy_url.rsplit('@', 1)[-1] if proxy_url else "direct")
+    print(f"Crawling prod sitemap via {mode} (max {max_attempts} attempts)")
+
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            content = _fetch_attempt(api_key, proxy_url)
+            if attempt > 1:
+                print(f"Crawl succeeded on attempt {attempt}")
+            return content
+        except Exception as e:
+            last_err = str(e)
+            print(f"Crawl attempt {attempt}/{max_attempts} failed: {last_err}")
+    raise RuntimeError(f"crawl failed after {max_attempts} attempts: {last_err}")
+
+
 def fetch_prod_sitemap_entries():
     """Fetch and parse the live prod news sitemap (through Cloudflare).
 
     Returns a list of dicts {url, publication_date, name, title}. Raises on
     HTTP error, unparseable body, or an empty sitemap so the caller can fall
-    back to the sheet-based generation.
-
-    Egress can be routed through a residential proxy / unlocker (e.g. Bright
-    Data) by setting CRAWL_PROXY_URL, needed when the datacenter IP gets
-    flagged by Cloudflare. Without it the request goes out directly."""
-    request_kwargs = {"timeout": 30}
-    proxy_url = os.environ.get("CRAWL_PROXY_URL")
-    if proxy_url:
-        request_kwargs["proxies"] = {"http": proxy_url, "https": proxy_url}
-        # Some unlockers terminate TLS with their own CA; allow opting out of
-        # verification via CRAWL_PROXY_INSECURE=1.
-        if os.environ.get("CRAWL_PROXY_INSECURE", "").lower() in ("1", "true", "yes"):
-            request_kwargs["verify"] = False
-        # Log host:port only, never the embedded credentials.
-        print(f"Crawling via proxy {proxy_url.rsplit('@', 1)[-1]}")
-
-    response = scraper.get(PROD_SITEMAP_URL, **request_kwargs)
-    if response.status_code != 200:
-        raise RuntimeError(f"prod sitemap fetch returned HTTP {response.status_code}")
+    back to the sheet-based generation. Egress mode is chosen by env (see
+    _fetch_prod_sitemap_raw)."""
+    raw = _fetch_prod_sitemap_raw()
 
     ns = {'s': XMLNS, 'news': NEWS_NS}
-    root = ET.fromstring(response.content)  # parse bytes for correct utf-8
+    root = ET.fromstring(raw)  # parse bytes for correct utf-8
 
     entries = []
     for url_el in root.findall('s:url', ns):
