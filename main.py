@@ -18,9 +18,13 @@ SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
 XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 NEWS_NS = "http://www.google.com/schemas/sitemap-news/0.9"
 
-# Live production Google-News sitemap (source of truth for recently published
-# URLs). Fetched through Cloudflare via cloudscraper.
-PROD_SITEMAP_URL = "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml"
+# Live production Google-News sitemaps (source of truth for recently published
+# URLs). Fetched through Cloudflare. Entries from every source are merged and
+# de-duplicated by URL.
+PROD_SITEMAP_URLS = [
+    "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml",
+    "https://www.pagesjaunes.fr/que-faire/sitemaps/sitemap-news.xml",
+]
 
 # --- Resilient parsing configuration -------------------------------------
 # The sheet is edited by humans who sometimes delete the header row, rename
@@ -349,12 +353,12 @@ def build_sitemap_xml(data):
 BRIGHTDATA_API_URL = "https://api.brightdata.com/request"
 
 
-def _fetch_attempt(api_key, proxy_url):
+def _fetch_attempt(api_key, proxy_url, target_url):
     """One fetch attempt for the current egress mode. Returns bytes or raises."""
     if api_key:
         zone = os.environ.get("BRIGHTDATA_ZONE", "sitemap_unlocker")
         country = os.environ.get("BRIGHTDATA_COUNTRY", "fr")  # egress from France
-        payload = {"zone": zone, "url": PROD_SITEMAP_URL, "format": "raw"}
+        payload = {"zone": zone, "url": target_url, "format": "raw"}
         if country:
             payload["country"] = country
         response = scraper.post(
@@ -377,17 +381,17 @@ def _fetch_attempt(api_key, proxy_url):
         # Some unlockers terminate TLS with their own CA; allow opting out.
         if os.environ.get("CRAWL_PROXY_INSECURE", "").lower() in ("1", "true", "yes"):
             request_kwargs["verify"] = False
-        response = scraper.get(PROD_SITEMAP_URL, **request_kwargs)
+        response = scraper.get(target_url, **request_kwargs)
     else:
-        response = scraper.get(PROD_SITEMAP_URL, timeout=30)
+        response = scraper.get(target_url, timeout=30)
 
     if response.status_code != 200:
         raise RuntimeError(f"HTTP {response.status_code}")
     return response.content
 
 
-def _fetch_prod_sitemap_raw():
-    """Fetch the raw prod sitemap bytes, choosing the egress mode by env.
+def _fetch_one_sitemap_raw(target_url):
+    """Fetch one sitemap's raw bytes, choosing the egress mode by env.
 
     Priority:
       1. Bright Data Web Unlocker API   -> BRIGHTDATA_API_KEY (+ BRIGHTDATA_ZONE)
@@ -395,7 +399,7 @@ def _fetch_prod_sitemap_raw():
       3. Direct request                 -> no env set (default)
 
     pagesjaunes sits behind Cloudflare, which rejects a fraction of exit IPs
-    with a 403 even from residential/ISP pools, so every mode is retried up to
+    with a 403 even from residential/ISP pools, so the fetch is retried up to
     CRAWL_MAX_ATTEMPTS until a good IP answers."""
     api_key = os.environ.get("BRIGHTDATA_API_KEY")
     proxy_url = os.environ.get("CRAWL_PROXY_URL")
@@ -405,30 +409,23 @@ def _fetch_prod_sitemap_raw():
     max_attempts = int(os.environ.get("CRAWL_MAX_ATTEMPTS", "3"))
 
     mode = "Bright Data API" if api_key else ("proxy " + proxy_url.rsplit('@', 1)[-1] if proxy_url else "direct")
-    print(f"Crawling prod sitemap via {mode} (max {max_attempts} attempts)")
+    print(f"Crawling {target_url} via {mode} (max {max_attempts} attempts)")
 
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
-            content = _fetch_attempt(api_key, proxy_url)
+            content = _fetch_attempt(api_key, proxy_url, target_url)
             if attempt > 1:
-                print(f"Crawl succeeded on attempt {attempt}")
+                print(f"  succeeded on attempt {attempt}")
             return content
         except Exception as e:
             last_err = str(e)
-            print(f"Crawl attempt {attempt}/{max_attempts} failed: {last_err}")
-    raise RuntimeError(f"crawl failed after {max_attempts} attempts: {last_err}")
+            print(f"  attempt {attempt}/{max_attempts} failed: {last_err}")
+    raise RuntimeError(f"crawl of {target_url} failed after {max_attempts} attempts: {last_err}")
 
 
-def fetch_prod_sitemap_entries():
-    """Fetch and parse the live prod news sitemap (through Cloudflare).
-
-    Returns a list of dicts {url, publication_date, name, title}. Raises on
-    HTTP error, unparseable body, or an empty sitemap so the caller can fall
-    back to the sheet-based generation. Egress mode is chosen by env (see
-    _fetch_prod_sitemap_raw)."""
-    raw = _fetch_prod_sitemap_raw()
-
+def _parse_sitemap_entries(raw):
+    """Parse sitemap bytes into a list of {url, publication_date, name, title}."""
     ns = {'s': XMLNS, 'news': NEWS_NS}
     root = ET.fromstring(raw)  # parse bytes for correct utf-8
 
@@ -443,11 +440,42 @@ def fetch_prod_sitemap_entries():
             'name': (url_el.findtext('.//news:name', default='', namespaces=ns) or '').strip(),
             'title': (url_el.findtext('.//news:title', default='', namespaces=ns) or '').strip(),
         })
-
-    if not entries:
-        raise RuntimeError("prod sitemap parsed but contained 0 URLs")
-    print(f"Crawled prod sitemap: {len(entries)} URLs")
     return entries
+
+
+def fetch_prod_sitemap_entries():
+    """Fetch and parse all live prod news sitemaps, merged and de-duplicated.
+
+    Returns a list of dicts {url, publication_date, name, title}. A source that
+    fails all retries is skipped (the others still contribute); only if EVERY
+    source fails does this raise, so the caller falls back to the sheet."""
+    all_entries = []
+    seen = set()
+    errors = []
+
+    for target_url in PROD_SITEMAP_URLS:
+        try:
+            raw = _fetch_one_sitemap_raw(target_url)
+            entries = _parse_sitemap_entries(raw)
+        except Exception as e:
+            errors.append(f"{target_url}: {e}")
+            print(f"Source failed, skipping: {target_url} ({e})")
+            continue
+
+        added = 0
+        for entry in entries:
+            key = entry['url'].rstrip('/')
+            if key in seen:
+                continue
+            seen.add(key)
+            all_entries.append(entry)
+            added += 1
+        print(f"  {target_url}: {len(entries)} URLs ({added} new)")
+
+    if not all_entries:
+        raise RuntimeError(f"all prod sitemaps failed: {'; '.join(errors)}")
+    print(f"Crawled {len(all_entries)} URLs from {len(PROD_SITEMAP_URLS)} sitemap(s)")
+    return all_entries
 
 
 def cross_check_with_sheet(entries):
