@@ -5,6 +5,8 @@ __pycache__/
 venv/
 sitemap.xml
 sitemap-news.xml
+sitemap-cache.xml
+sitemap-cache.xml.tmp
 coolify_secret.txt
 generate_creds.py
 .env.local

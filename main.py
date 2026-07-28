@@ -3,6 +3,7 @@ import base64
 import os
 import json
 import unicodedata
+import concurrent.futures
 import cloudscraper
 import gspread
 from google.oauth2.service_account import Credentials
@@ -18,9 +19,18 @@ SHEET_ID = '1B93nJwvS591zZ-x7nGCwwPkOcbnH4ZifApO_QSQztzg'
 XMLNS = "http://www.sitemaps.org/schemas/sitemap/0.9"
 NEWS_NS = "http://www.google.com/schemas/sitemap-news/0.9"
 
-# Live production Google-News sitemap (source of truth for recently published
-# URLs). Fetched through Cloudflare via cloudscraper.
-PROD_SITEMAP_URL = "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml"
+# Live production Google-News sitemaps (source of truth for recently published
+# URLs). Fetched through Cloudflare. Entries from every source are merged and
+# de-duplicated by URL.
+PROD_SITEMAP_URLS = [
+    "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml",
+    "https://www.pagesjaunes.fr/que-faire/sitemaps/sitemap-news.xml",
+]
+
+# The crawl runs off-request (triggered by a scheduler hitting /refresh) and
+# writes the result here; /sitemap.xml only serves this file, so the endpoint
+# never blocks on the slow Cloudflare crawl.
+SITEMAP_CACHE_PATH = os.environ.get("SITEMAP_CACHE_PATH", "sitemap-cache.xml")
 
 # --- Resilient parsing configuration -------------------------------------
 # The sheet is edited by humans who sometimes delete the header row, rename
@@ -349,19 +359,20 @@ def build_sitemap_xml(data):
 BRIGHTDATA_API_URL = "https://api.brightdata.com/request"
 
 
-def _fetch_attempt(api_key, proxy_url):
+def _fetch_attempt(api_key, proxy_url, target_url):
     """One fetch attempt for the current egress mode. Returns bytes or raises."""
+    timeout = int(os.environ.get("CRAWL_TIMEOUT", "30"))
     if api_key:
         zone = os.environ.get("BRIGHTDATA_ZONE", "sitemap_unlocker")
         country = os.environ.get("BRIGHTDATA_COUNTRY", "fr")  # egress from France
-        payload = {"zone": zone, "url": PROD_SITEMAP_URL, "format": "raw"}
+        payload = {"zone": zone, "url": target_url, "format": "raw"}
         if country:
             payload["country"] = country
         response = scraper.post(
             BRIGHTDATA_API_URL,
             json=payload,
             headers={"Authorization": f"Bearer {api_key}"},
-            timeout=60,
+            timeout=timeout,
         )
         # Web Unlocker reports target-side failure as HTTP 200 + empty body +
         # x-brd-error header (and only bills successful unlocks).
@@ -373,21 +384,21 @@ def _fetch_attempt(api_key, proxy_url):
         return response.content
 
     if proxy_url:
-        request_kwargs = {"timeout": 30, "proxies": {"http": proxy_url, "https": proxy_url}}
+        request_kwargs = {"timeout": timeout, "proxies": {"http": proxy_url, "https": proxy_url}}
         # Some unlockers terminate TLS with their own CA; allow opting out.
         if os.environ.get("CRAWL_PROXY_INSECURE", "").lower() in ("1", "true", "yes"):
             request_kwargs["verify"] = False
-        response = scraper.get(PROD_SITEMAP_URL, **request_kwargs)
+        response = scraper.get(target_url, **request_kwargs)
     else:
-        response = scraper.get(PROD_SITEMAP_URL, timeout=30)
+        response = scraper.get(target_url, timeout=timeout)
 
     if response.status_code != 200:
         raise RuntimeError(f"HTTP {response.status_code}")
     return response.content
 
 
-def _fetch_prod_sitemap_raw():
-    """Fetch the raw prod sitemap bytes, choosing the egress mode by env.
+def _fetch_one_sitemap_raw(target_url):
+    """Fetch one sitemap's raw bytes, choosing the egress mode by env.
 
     Priority:
       1. Bright Data Web Unlocker API   -> BRIGHTDATA_API_KEY (+ BRIGHTDATA_ZONE)
@@ -395,40 +406,33 @@ def _fetch_prod_sitemap_raw():
       3. Direct request                 -> no env set (default)
 
     pagesjaunes sits behind Cloudflare, which rejects a fraction of exit IPs
-    with a 403 even from residential/ISP pools, so every mode is retried up to
+    with a 403 even from residential/ISP pools, so the fetch is retried up to
     CRAWL_MAX_ATTEMPTS until a good IP answers."""
     api_key = os.environ.get("BRIGHTDATA_API_KEY")
     proxy_url = os.environ.get("CRAWL_PROXY_URL")
     # Web Unlocker (with Premium domains) solves Cloudflare server-side, so a
-    # low retry count is enough — we deliberately avoid hammering the target
-    # (traffic is only ~3 crawls/day).
+    # low retry count is enough. This runs off-request (scheduled), so it never
+    # impacts /sitemap.xml latency.
     max_attempts = int(os.environ.get("CRAWL_MAX_ATTEMPTS", "3"))
 
     mode = "Bright Data API" if api_key else ("proxy " + proxy_url.rsplit('@', 1)[-1] if proxy_url else "direct")
-    print(f"Crawling prod sitemap via {mode} (max {max_attempts} attempts)")
+    print(f"Crawling {target_url} via {mode} (max {max_attempts} attempts)")
 
     last_err = None
     for attempt in range(1, max_attempts + 1):
         try:
-            content = _fetch_attempt(api_key, proxy_url)
+            content = _fetch_attempt(api_key, proxy_url, target_url)
             if attempt > 1:
-                print(f"Crawl succeeded on attempt {attempt}")
+                print(f"  {target_url}: succeeded on attempt {attempt}")
             return content
         except Exception as e:
             last_err = str(e)
-            print(f"Crawl attempt {attempt}/{max_attempts} failed: {last_err}")
-    raise RuntimeError(f"crawl failed after {max_attempts} attempts: {last_err}")
+            print(f"  {target_url}: attempt {attempt}/{max_attempts} failed: {last_err}")
+    raise RuntimeError(f"crawl of {target_url} failed after {max_attempts} attempts: {last_err}")
 
 
-def fetch_prod_sitemap_entries():
-    """Fetch and parse the live prod news sitemap (through Cloudflare).
-
-    Returns a list of dicts {url, publication_date, name, title}. Raises on
-    HTTP error, unparseable body, or an empty sitemap so the caller can fall
-    back to the sheet-based generation. Egress mode is chosen by env (see
-    _fetch_prod_sitemap_raw)."""
-    raw = _fetch_prod_sitemap_raw()
-
+def _parse_sitemap_entries(raw):
+    """Parse sitemap bytes into a list of {url, publication_date, name, title}."""
     ns = {'s': XMLNS, 'news': NEWS_NS}
     root = ET.fromstring(raw)  # parse bytes for correct utf-8
 
@@ -443,11 +447,48 @@ def fetch_prod_sitemap_entries():
             'name': (url_el.findtext('.//news:name', default='', namespaces=ns) or '').strip(),
             'title': (url_el.findtext('.//news:title', default='', namespaces=ns) or '').strip(),
         })
-
-    if not entries:
-        raise RuntimeError("prod sitemap parsed but contained 0 URLs")
-    print(f"Crawled prod sitemap: {len(entries)} URLs")
     return entries
+
+
+def fetch_prod_sitemap_entries():
+    """Fetch and parse all prod news sitemaps in parallel, merged + de-duped.
+
+    Sources are fetched concurrently so total time is the slowest source, not
+    the sum. A source that fails all retries is skipped (the others still
+    contribute); only if EVERY source fails does this raise."""
+    raw_by_url = {}
+    errors = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROD_SITEMAP_URLS)) as pool:
+        futures = {pool.submit(_fetch_one_sitemap_raw, url): url for url in PROD_SITEMAP_URLS}
+        for future in concurrent.futures.as_completed(futures):
+            url = futures[future]
+            try:
+                raw_by_url[url] = future.result()
+            except Exception as e:
+                errors.append(f"{url}: {e}")
+                print(f"Source failed, skipping: {url} ({e})")
+
+    # Merge in configured order for deterministic output.
+    all_entries, seen = [], set()
+    for url in PROD_SITEMAP_URLS:
+        raw = raw_by_url.get(url)
+        if raw is None:
+            continue
+        entries = _parse_sitemap_entries(raw)
+        added = 0
+        for entry in entries:
+            key = entry['url'].rstrip('/')
+            if key in seen:
+                continue
+            seen.add(key)
+            all_entries.append(entry)
+            added += 1
+        print(f"  {url}: {len(entries)} URLs ({added} new)")
+
+    if not all_entries:
+        raise RuntimeError(f"all prod sitemaps failed: {'; '.join(errors)}")
+    print(f"Crawled {len(all_entries)} URLs from {len(PROD_SITEMAP_URLS)} sitemap(s)")
+    return all_entries
 
 
 def cross_check_with_sheet(entries):
@@ -498,26 +539,65 @@ def build_news_sitemap_from_entries(entries):
     return f.getvalue()
 
 
-@app.get("/sitemap.xml")
-async def generate_sitemap():
-    """Crawl-first sitemap served at the existing address.
+def _write_cache(xml_bytes):
+    """Atomically write the sitemap cache file (write temp, then rename)."""
+    tmp = SITEMAP_CACHE_PATH + ".tmp"
+    with open(tmp, "wb") as fh:
+        fh.write(xml_bytes)
+    os.replace(tmp, SITEMAP_CACHE_PATH)
 
-    Source of truth = the live prod sitemap (crawled through Cloudflare),
-    cross-checked against the sheet. If the crawl fails for any reason, falls
-    back to the sheet-based generation so the endpoint always answers."""
+
+def refresh_sitemap_cache():
+    """Crawl the prod sitemaps, build the news sitemap and update the cache.
+
+    Runs off-request (triggered by /refresh or the CLI). On crawl failure the
+    existing cache is kept untouched; only if there is no cache at all do we
+    seed it from the sheet so /sitemap.xml has something to serve."""
     try:
         entries = fetch_prod_sitemap_entries()
-        cross_check_with_sheet(entries)
-        xml_content = build_news_sitemap_from_entries(entries)
-        print(f"Serving crawled sitemap: {len(entries)} URLs")
-        return Response(content=xml_content, media_type="application/xml")
     except Exception as e:
-        print(f"Crawl failed ({e!r}); falling back to sheet-based generation")
-        try:
-            data = get_sheet_data()
-        except Exception as sheet_err:
-            raise HTTPException(status_code=500, detail=f"crawl and sheet both failed: {sheet_err}")
-        return Response(content=build_sitemap_xml(data), media_type="application/xml")
+        if not os.path.exists(SITEMAP_CACHE_PATH):
+            print(f"Crawl failed ({e}); no cache yet, seeding from sheet")
+            _write_cache(build_sitemap_xml(get_sheet_data()))
+            return {"status": "crawl_failed_seeded_from_sheet", "error": str(e)}
+        print(f"Crawl failed ({e}); keeping existing cache")
+        return {"status": "crawl_failed_kept_cache", "error": str(e)}
+
+    cross_check_with_sheet(entries)
+    _write_cache(build_news_sitemap_from_entries(entries))
+    print(f"Cache updated: {len(entries)} URLs")
+    return {"status": "ok", "urls": len(entries)}
+
+
+@app.get("/sitemap.xml")
+def generate_sitemap():
+    """Serve the cached sitemap (instant, never crawls).
+
+    The cache is refreshed off-request by the scheduler hitting /refresh. On a
+    cold start with no cache yet, we serve the sheet-based sitemap as a
+    stopgap until the first refresh runs."""
+    if os.path.exists(SITEMAP_CACHE_PATH):
+        with open(SITEMAP_CACHE_PATH, "rb") as fh:
+            return Response(content=fh.read(), media_type="application/xml")
+
+    print("No sitemap cache yet; serving sheet fallback")
+    try:
+        return Response(content=build_sitemap_xml(get_sheet_data()), media_type="application/xml")
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"no cache and sheet failed: {e}")
+
+
+@app.get("/refresh")
+def refresh(token: str = ""):
+    """Trigger a crawl + cache refresh. Called by the scheduler every ~4h.
+
+    Protected by REFRESH_TOKEN when that env var is set: the caller must pass
+    ?token=<value>. Runs synchronously (in FastAPI's threadpool) so it never
+    blocks the event loop / other requests."""
+    expected = os.environ.get("REFRESH_TOKEN")
+    if expected and token != expected:
+        raise HTTPException(status_code=403, detail="invalid or missing token")
+    return refresh_sitemap_cache()
 
 
 if __name__ == "__main__":
@@ -528,22 +608,11 @@ if __name__ == "__main__":
     # can inspect the result without running the web server. Needs credentials
     # (GOOGLE_CREDENTIALS_JSON env var or ../creds/*.json).
     if "--crawl" in sys.argv:
-        # Crawl-first flow: fetch prod sitemap, cross-check the sheet, dump the
-        # result. Falls back to sheet-based generation if the crawl fails.
-        out_path = "sitemap-news.xml"
-        for arg in sys.argv[1:]:
-            if not arg.startswith("-"):
-                out_path = arg
-        try:
-            entries = fetch_prod_sitemap_entries()
-            cross_check_with_sheet(entries)
-            xml_content = build_news_sitemap_from_entries(entries)
-        except Exception as e:
-            print(f"Crawl failed ({e!r}); falling back to sheet-based generation")
-            xml_content = build_sitemap_xml(get_sheet_data())
-        with open(out_path, "wb") as fh:
-            fh.write(xml_content)
-        print(f"Wrote {out_path}")
+        # Run the same crawl + cache refresh the scheduler triggers, and write
+        # the cache file (SITEMAP_CACHE_PATH) so you can inspect the result.
+        result = refresh_sitemap_cache()
+        print(f"Refresh result: {result}")
+        print(f"Cache written to {SITEMAP_CACHE_PATH}")
     elif "--dump" in sys.argv:
         out_path = "sitemap.xml"
         for arg in sys.argv[1:]:
