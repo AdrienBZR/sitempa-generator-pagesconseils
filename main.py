@@ -21,10 +21,12 @@ NEWS_NS = "http://www.google.com/schemas/sitemap-news/0.9"
 
 # Live production Google-News sitemaps (source of truth for recently published
 # URLs). Fetched through Cloudflare. Entries from every source are merged and
-# de-duplicated by URL.
-PROD_SITEMAP_URLS = [
-    "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml",
-    "https://www.pagesjaunes.fr/que-faire/sitemaps/sitemap-news.xml",
+# de-duplicated by URL. Per source, `sheet_fallback` says what to do when the
+# crawl fails: pagesconseils falls back to the Google Sheet (its editorial
+# source); que-faire has no sheet data, so on failure it is simply skipped.
+PROD_SITEMAPS = [
+    {"url": "https://www.pagesjaunes.fr/pagesconseils/sitemaps/sitemap-news.xml", "sheet_fallback": True},
+    {"url": "https://www.pagesjaunes.fr/que-faire/sitemaps/sitemap-news.xml", "sheet_fallback": False},
 ]
 
 # The crawl runs off-request (triggered by a scheduler hitting /refresh) and
@@ -450,45 +452,33 @@ def _parse_sitemap_entries(raw):
     return entries
 
 
-def fetch_prod_sitemap_entries():
-    """Fetch and parse all prod news sitemaps in parallel, merged + de-duped.
+def _sheet_entries():
+    """Google Sheet rows (Publié/Programmé) as crawl-style entries.
 
-    Sources are fetched concurrently so total time is the slowest source, not
-    the sum. A source that fails all retries is skipped (the others still
-    contribute); only if EVERY source fails does this raise."""
-    raw_by_url = {}
-    errors = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROD_SITEMAP_URLS)) as pool:
-        futures = {pool.submit(_fetch_one_sitemap_raw, url): url for url in PROD_SITEMAP_URLS}
-        for future in concurrent.futures.as_completed(futures):
-            url = futures[future]
-            try:
-                raw_by_url[url] = future.result()
-            except Exception as e:
-                errors.append(f"{url}: {e}")
-                print(f"Source failed, skipping: {url} ({e})")
-
-    # Merge in configured order for deterministic output.
-    all_entries, seen = [], set()
-    for url in PROD_SITEMAP_URLS:
-        raw = raw_by_url.get(url)
-        if raw is None:
+    Used as the fallback for the pagesconseils source when its crawl fails —
+    the sheet is that section's editorial source of truth."""
+    entries = []
+    for row in get_sheet_data():
+        if normalize(row.get('statut')) not in TARGET_STATUSES:
             continue
-        entries = _parse_sitemap_entries(raw)
-        added = 0
-        for entry in entries:
-            key = entry['url'].rstrip('/')
-            if key in seen:
-                continue
-            seen.add(key)
-            all_entries.append(entry)
-            added += 1
-        print(f"  {url}: {len(entries)} URLs ({added} new)")
-
-    if not all_entries:
-        raise RuntimeError(f"all prod sitemaps failed: {'; '.join(errors)}")
-    print(f"Crawled {len(all_entries)} URLs from {len(PROD_SITEMAP_URLS)} sitemap(s)")
-    return all_entries
+        url = (row.get('url') or '').strip()
+        if not url:
+            continue
+        pub = ''
+        raw_date = (row.get('date') or '').strip()
+        if raw_date:
+            day = parse_date(raw_date)  # YYYY-MM-DD (or raw if unparseable)
+            plage = (row.get('plage') or '').strip().lower()
+            time_str = None
+            if 'matin' in plage:
+                time_str = '05:00+01:00'
+            elif 'midi' in plage:
+                time_str = '11:00+01:00'
+            elif 'soir' in plage:
+                time_str = '17:00+01:00'
+            pub = f"{day}T{time_str}" if (day and time_str) else (day or '')
+        entries.append({'url': url, 'publication_date': pub, 'name': '', 'title': ''})
+    return entries
 
 
 def cross_check_with_sheet(entries):
@@ -550,23 +540,62 @@ def _write_cache(xml_bytes):
 def refresh_sitemap_cache():
     """Crawl the prod sitemaps, build the news sitemap and update the cache.
 
-    Runs off-request (triggered by /refresh or the CLI). On crawl failure the
-    existing cache is kept untouched; only if there is no cache at all do we
-    seed it from the sheet so /sitemap.xml has something to serve."""
-    try:
-        entries = fetch_prod_sitemap_entries()
-    except Exception as e:
-        if not os.path.exists(SITEMAP_CACHE_PATH):
-            print(f"Crawl failed ({e}); no cache yet, seeding from sheet")
-            _write_cache(build_sitemap_xml(get_sheet_data()))
-            return {"status": "crawl_failed_seeded_from_sheet", "error": str(e)}
-        print(f"Crawl failed ({e}); keeping existing cache")
-        return {"status": "crawl_failed_kept_cache", "error": str(e)}
+    Runs off-request (triggered by /refresh or the CLI). Per source: use the
+    fresh crawl; if the crawl fails, fall back to the Google Sheet only for
+    sources flagged `sheet_fallback` (pagesconseils) — others (que-faire) are
+    simply skipped. The previous cache is never reused (stale = useless). We
+    only leave the cache untouched if we end up with zero URLs (nothing to
+    serve), to avoid publishing an empty sitemap."""
+    # Crawl all sources in parallel; latency doesn't matter (off-request).
+    raw_by_url = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(PROD_SITEMAPS)) as pool:
+        futures = {pool.submit(_fetch_one_sitemap_raw, s["url"]): s["url"] for s in PROD_SITEMAPS}
+        for future in concurrent.futures.as_completed(futures):
+            url = futures[future]
+            try:
+                raw_by_url[url] = future.result()
+            except Exception as e:
+                print(f"Crawl failed for {url}: {e}")
 
-    cross_check_with_sheet(entries)
-    _write_cache(build_news_sitemap_from_entries(entries))
-    print(f"Cache updated: {len(entries)} URLs")
-    return {"status": "ok", "urls": len(entries)}
+    sheet_fallback_entries = None  # fetched lazily, at most once
+    all_entries, seen = [], set()
+    used = []
+    for src in PROD_SITEMAPS:
+        url = src["url"]
+        if url in raw_by_url:
+            entries = _parse_sitemap_entries(raw_by_url[url])
+            label = f"crawled ({len(entries)})"
+        elif src.get("sheet_fallback"):
+            if sheet_fallback_entries is None:
+                try:
+                    sheet_fallback_entries = _sheet_entries()
+                except Exception as e:
+                    print(f"Sheet fallback failed: {e}")
+                    sheet_fallback_entries = []
+            entries = sheet_fallback_entries
+            label = f"sheet fallback ({len(entries)})"
+        else:
+            entries = []
+            label = "skipped (no fallback)"
+
+        added = 0
+        for entry in entries:
+            key = entry['url'].rstrip('/')
+            if key in seen:
+                continue
+            seen.add(key)
+            all_entries.append(entry)
+            added += 1
+        used.append(f"{url}: {label}, {added} new")
+        print(f"  {url}: {label}, {added} new")
+
+    if not all_entries:
+        print("No URLs from any source; cache left unchanged")
+        return {"status": "no_data_cache_unchanged", "sources": used}
+
+    _write_cache(build_news_sitemap_from_entries(all_entries))
+    print(f"Cache updated: {len(all_entries)} URLs")
+    return {"status": "ok", "urls": len(all_entries), "sources": used}
 
 
 @app.get("/sitemap.xml")
